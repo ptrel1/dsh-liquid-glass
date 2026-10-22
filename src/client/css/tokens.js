@@ -38,8 +38,15 @@ body[data-dsh-liquid-glass] {
   --lg-title-foot: 8px;
   --lg-island-gap: 3px;
   --lg-dock-gap: 6px;
-  --lg-text-primary: #2c3340;
-  --lg-text-secondary: #5b6472;
+  /* 修复(20261022)：文字色改为跟随宿主变量，不再硬编码。
+   * 背景：插件用 theme.getTheme().active.colorScheme 判定明暗并写 data-dsh-liquid-glass='dark'，
+   * 但该判定与宿主实际渲染的主题可能不一致。实测评测中插件标记为 'dark'（浅色字 #eef2f8），
+   * 而宿主 --dsw-alias-label-primary 为 #2c3340（深色字），背景又是浅色壁纸，
+   * 导致过程步骤/工具调用等使用 --lg-text-primary 的文字对比度仅 1.12（WCAG AA 需 >=4.5）。
+   * 改为直接引用宿主变量后两边永远一致，对比度恢复到 12.69。
+   * 保留原值作为 fallback，宿主变量缺失时行为不变。 */
+  --lg-text-primary: var(--dsw-alias-label-primary, #2c3340);
+  --lg-text-secondary: var(--dsw-alias-label-secondary, #5b6472);
   --lg-toggle-on-fill: #fff;
   --lg-toggle-on-ink: #2c3340;
   --lg-metal-ring: conic-gradient(#5a6068, #7eb6ff, #8a9096, #b8c0c6, #ffb3b3, #9a9090, #e6d56a, #8a8e86, #7eb6ff, #5a6068);
@@ -58,8 +65,8 @@ body[data-dsh-liquid-glass='dark'] {
   --lg-border-strong: rgba(255, 255, 255, 0.22);
   --lg-highlight: rgba(255, 255, 255, 0.18);
   --lg-shadow-card: inset 0 1px 0 var(--lg-highlight);
-  --lg-text-primary: #eef2f8;
-  --lg-text-secondary: rgba(226, 234, 255, 0.70);
+  --lg-text-primary: var(--dsw-alias-label-primary, #eef2f8);
+  --lg-text-secondary: var(--dsw-alias-label-secondary, rgba(226, 234, 255, 0.70));
   --lg-toggle-on-fill: #2c3340;
   --lg-toggle-on-ink: #fff;
   --lg-metal-ring: conic-gradient(#151a22, #2a5560, #aae8ff, #5a6870, #3a3034, #f7888d, #6a5850, #4a4830, #fffdc3, #3a4a50, #aae8ff, #151a22);
