@@ -391,23 +391,27 @@ body[data-dsh-liquid-glass] [data-slot='conversation.session'] > :first-child:no
    insets against the actual scrollport and sticky composer rectangles, so
    transcript pixels are genuinely clipped at both viewport edges instead of
    being covered by an opaque colour slab. Trajectory does not have this node. */
+/* 修复(20261022)：删除 [data-chat-flow] 上的动态 clip-path。
+ *
+ * 原实现给内容列加 clip-path: inset(--lg-chat-clip-top ...)，变量由 JS 按
+ * 「scrollRect.top - columnRect.top」逐帧写入。实测该差值滚动后可达 1.7 万 px
+ * （17820），而 inset() 是相对元素自身盒子裁剪，导致：
+ *   ① 内容被从顶部整片切掉 → 过程步骤/工具调用文字被挖空，完全不可见；
+ *   ② 每帧改写超大 clip-path → 整层重新栅格化，滚动明显卡顿（移动端尤甚）。
+ *
+ * 根本原因：这段裁剪是多余的。滚动容器 [data-conversation-scroll] 本身
+ * 就是 overflow:auto 的滚动所有者，滚出视口的内容浏览器天然不绘制；
+ * 容器自身的静态 clip-path(见上方规则) 已保证内容在玻璃岛圆角内被裁齐。
+ * 再对内容列叠一层动态裁剪，既是二次裁剪，坐标系也不对。
+ *
+ * 保留 padding-bottom 作为底部呼吸位。 */
 body[data-dsh-liquid-glass] [data-conversation-scroll] [data-chat-flow] {
   box-sizing: border-box;
   padding-bottom: 6px;
-  clip-path: inset(
-    var(--lg-chat-clip-top, 0px)
-    0
-    calc(var(--lg-chat-clip-bottom, 0px) + var(--lg-pane-gutter))
-    0
-  );
 }
 
-/* clip-path is a fixed containing block. Official tooltips sit next to the
-   anchor with position:fixed and no portal, so they vanish inside the clip.
-   Drop the clip only while a bubble is open in this flow. */
-body[data-dsh-liquid-glass] [data-conversation-scroll] [data-chat-flow]:has([role='tooltip']) {
-  clip-path: none;
-}
+/* 20261022：内容列已不再应用 clip-path，此处原本用于在 tooltip 打开时
+   释放裁剪的规则已无必要，保留说明以免后人误加回来。 */
 
 body[data-dsh-liquid-glass] [data-slot='conversation.session'] > :first-child:has([data-conversation-composer-overlay]) {
   padding: 12px 24px;
@@ -2773,8 +2777,8 @@ body[data-dsh-liquid-glass] [role='dialog'] button:disabled {
           changed.changed = changed.rootChanged || changed.headerChanged || changed.scrollChanged || changed.seatChanged || changed.columnChanged
           changed.ready = isReady(next)
           if (changed.scrollChanged) {
-            if (snap.scroll !== null) snap.scroll.removeEventListener('scroll', scheduleTranscriptCrop)
-            if (next.scroll !== null) next.scroll.addEventListener('scroll', scheduleTranscriptCrop, { passive: true })
+            /* 20261022: 对应取消监听（旧实现遗留） */
+            /* 20261022: 不再监听 scroll —— 裁剪逻辑已移除，无需逐帧重算。 */
           }
           if (changed.rootChanged) {
             releaseStyleOwner(snap.root, '--lg-header-height', owner)
@@ -2790,29 +2794,45 @@ body[data-dsh-liquid-glass] [role='dialog'] button:disabled {
           return changed
         }
 
-        function cropTranscript() {
-          if (snap.scroll === null || snap.seat === null || snap.column === null) return
-          if (typeof snap.scroll.getBoundingClientRect !== 'function'
-            || typeof snap.seat.getBoundingClientRect !== 'function'
-            || typeof snap.column.getBoundingClientRect !== 'function') return
-          var scrollRect = snap.scroll.getBoundingClientRect()
-          var seatRect = snap.seat.getBoundingClientRect()
-          var columnRect = snap.column.getBoundingClientRect()
-          if ((scrollRect.width || 0) === 0 && (scrollRect.height || 0) === 0) return
-          var height = Math.max(0, columnRect.height || (columnRect.bottom - columnRect.top))
-          var top = Math.min(height, Math.max(0, Math.ceil(scrollRect.top - columnRect.top)))
-          var visibleBottom = Math.min(scrollRect.bottom, seatRect.top)
-          var bottom = Math.min(Math.max(0, height - top), Math.max(0, Math.ceil(columnRect.bottom - visibleBottom)))
-          if (lastClipTop !== top) {
-            snap.column.style.setProperty('--lg-chat-clip-top', top + 'px')
+        /* 裁剪诊断日志开关：localStorage 设置 'dsh-liquid-glass:debug-crop' = '1' 开启。
+         * 开启后仅在裁剪值触发上限时打印一次结构化日志，便于定位基准计算偏差。 */
+        var cropDebugLast = null
+        function debugCrop() {
+          try { return window.localStorage.getItem('dsh-liquid-glass:debug-crop') === '1' } catch (err) { return false }
+        }
+
+        /* 滚动节流(20261022)：clip-path 变化会触发整层重新栅格化，滚动过程中
+         * 每帧改写会导致明显卡顿（移动端尤甚）。改为：
+         *   - 滚动期间：立即用「同步 scrollTop」以 CSS 变量粗对齐（廉价），
+         *     但不做完整重算；
+         *   - 滚动停止 120ms 后：做一次精确重算。
+         * 这样滚动时画面仍然连续对齐，又避免逐帧重算。 */
+        var scrollIdleTimer = null
+        var lastScrollTop = null
+
+        function cropOnScroll() {
+          if (snap.scroll === null || snap.column === null) return
+          var st = snap.scroll.scrollTop || 0
+          if (st !== lastScrollTop) {
+            lastScrollTop = st
+            snap.column.style.setProperty('--lg-chat-clip-top', Math.round(st) + 'px')
             claimStyleOwner(snap.column, '--lg-chat-clip-top', owner)
-            lastClipTop = top
+            lastClipTop = Math.round(st)
           }
-          if (lastClipBottom !== bottom) {
-            snap.column.style.setProperty('--lg-chat-clip-bottom', bottom + 'px')
-            claimStyleOwner(snap.column, '--lg-chat-clip-bottom', owner)
-            lastClipBottom = bottom
-          }
+          if (scrollIdleTimer !== null) clearTimeout(scrollIdleTimer)
+          scrollIdleTimer = setTimeout(function () {
+            scrollIdleTimer = null
+            needsCrop = true
+            frameGate.schedule()
+          }, 120)
+        }
+
+        /* 20261022：内容列裁剪已移除（见 conversation-scroll.js 顶部说明）。
+         * 保留本函数为空实现，维持 MetricsBridge 的调用链与生命周期不变，
+         * 避免因删函数导致 observer/eff 结构变化。--lg-header-height 仍由
+         * applyLayout 正常写入，玻璃岛的头部尺寸测量不受影响。 */
+        function cropTranscript() {
+          /* no-op */
         }
 
         function applyLayout() {
