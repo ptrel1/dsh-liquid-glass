@@ -14,8 +14,8 @@
 body[data-dsh-liquid-glass] {
   --lg-wallpaper-opacity: 0.88;
   --lg-glass-blur: 20px;
-  --lg-shell-bg: rgba(255, 255, 255, 0.10);
-  --lg-pane-bg: rgba(255, 255, 255, 0.12);
+  --lg-shell-bg: rgba(255, 255, 255, 0.52);
+  --lg-pane-bg: rgba(255, 255, 255, 0.52);
   --lg-card-bg: rgba(255, 255, 255, 0.46);
   --lg-overlay-bg: rgba(248, 251, 255, 0.92);
   --lg-control-bg: rgba(248, 251, 255, 0.80);
@@ -55,8 +55,10 @@ body[data-dsh-liquid-glass] {
 }
 
 body[data-dsh-liquid-glass='dark'] {
-  --lg-shell-bg: rgba(16, 22, 36, 0.16);
-  --lg-pane-bg: rgba(18, 24, 40, 0.14);
+  /* 20261027：wash 回退到 0.02 后，可读性由玻璃岛自身不透明度承担。
+   * 侧栏与正文用同一色值，避免左右色差；正文略高以保证文字对比度。 */
+  --lg-shell-bg: rgba(16, 22, 36, 0.42);
+  --lg-pane-bg: rgba(16, 22, 36, 0.42);
   --lg-card-bg: rgba(24, 32, 50, 0.52);
   --lg-overlay-bg: rgba(22, 26, 36, 0.92);
   --lg-control-bg: rgba(24, 32, 50, 0.76);

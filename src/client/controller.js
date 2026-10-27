@@ -40,22 +40,26 @@
         var surface = glassOn ? surfaceScheme(theme, background) : scheme
         var fallback = FALLBACK_BASE[surface]
         var hasWallpaper = background.id !== 'none' || background.custom !== null
-        /* 底色不透明度 wash（20261027 修）
+        /* 底色不透明度 wash（20261027 修订：回退为固定低值）
          *
-         * ⚠️ 原实现 glassOn 且有壁纸时硬编码 0.02，隐含假设「壁纸几乎不透明」
-         *    （默认 opacity=0.88）。一旦用户把壁纸不透明度调低（最低 0.35），
-         *    壁纸半透 + 底色全透 = 屏上没有任何实色遮挡，文字直接糊在壁纸上。
+         * ⚠️ 曾经试过让 wash 跟壁纸不透明度联动（1 - opacity*0.98），
+         *    想解决「壁纸调低后文字糊在壁纸上」。但实测发现该方案引入更严重问题：
          *
-         * 正确关系：壁纸越透明 → 底色越要实，两者互补，保证总覆盖度稳定。
-         *   opacity=1.00 → wash≈0.02（原行为，壁纸自身足够）
-         *   opacity=0.88 → wash≈0.14
-         *   opacity=0.35 → wash≈0.66（补足遮蔽）
-         * 系数 0.98 而非 1：保留 2% 透光，避免完全失去玻璃感。
+         *   DSH 的正文区祖先链里有三层都用 --dsw-alias-bg-base：
+         *     wSkVaW_root / pI_x6G_frame / BODY
+         *   而侧栏只有 BODY 一层。
+         *
+         *   wash=0.02 时：正文合成 5.9%，侧栏 2.0% → 差 3.9pp，看不出来
+         *   wash=0.44 时：正文合成 82.7%，侧栏 44.3% → 差 38.4pp，肉眼可见竖线分界
+         *
+         * 三层叠加会把 wash 的差异按指数放大，破坏左右一致性。
+         *
+         * ⇒ 回到固定 0.02：壁纸主导显示，左右自然统一。
+         *   文字可读性改由玻璃岛自身不透明度保证（见 css/tokens.js 的 --lg-*-bg），
+         *   那是插件自己的样式，不依赖 DSH 内部结构。
          */
-        var wallpaperOpacity = clamp(opacity, 0.35, 1, DEFAULT_WALLPAPER_OPACITY)
-        var wash = glassOn
-          ? (hasWallpaper ? (1 - wallpaperOpacity * 0.98) : 1)
-          : wallpaperOpacity
+        var wash = glassOn ? (hasWallpaper ? 0.02 : 1) : clamp(opacity, 0.35, 1, DEFAULT_WALLPAPER_OPACITY)
+
         var base = computedColor('--dsw-alias-bg-base', fallback)
         var sidebar = computedColor('--dsw-specific-sidebar-fill', fallback)
         var baseLight = glassOn ? fallback : (scheme === 'light' ? base : FALLBACK_BASE.light)
