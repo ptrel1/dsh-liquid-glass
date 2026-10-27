@@ -16,7 +16,7 @@
     var SERVER_KEY_MAP = {
       'dsh-liquid-glass:effect': 'effect',
       'dsh-liquid-glass:skin': 'skin',
-      'dsh-liquid-glass:wallpaper': 'wallpaper',
+      'dsh-liquid-glass.background': 'wallpaper',   // ⚠️ 键名必须是 BACKGROUND_STORAGE 的值
       'dsh-liquid-glass.glass.blur': 'glassBlur',
       'dsh-liquid-glass.background.opacity': 'backgroundOpacity',
     }
@@ -178,6 +178,7 @@
                   if (!dataUrl) return
                   var idx = local.findIndex(function (x) { return x && x.id === id })
                   var item = { id: id, data: dataUrl, hash: entry.hash }
+                  if (typeof entry.luminance === 'number') item.luminance = entry.luminance
                   if (idx === -1) local.push(item)
                   else local[idx] = item
                 })
@@ -203,14 +204,88 @@
     }
 
     /* 把本地新增的图片上传服务端。仅在用户新导入时调用。 */
+    /* ===== 壁纸亮度测量(20261027) =====
+     * 目的：让自定义壁纸也能决定 UI 明暗，且随「不透明度」变化（方案 B）。
+     *
+     * 为什么存亮度而不是直接存 tone：
+     *   最终视觉 = 图片亮度 × opacity + 底层亮度 × (1 - opacity)
+     *   tone 依赖当前 opacity，而上传时算不出用户日后会调成多少。
+     *   所以只存图片自身亮度（唯一稳定属性），渲染时再按当时 opacity 换算。
+     *
+     * 原理：缩到 16x16 画到 canvas，按 Rec.709 感知亮度加权求均值：
+     *   L = 0.2126*R + 0.7152*G + 0.0722*B
+     * ⚠️ 只在导入时算一次，不在渲染路径上。
+     * ⚠️ canvas 被跨域污染/解码失败时返回 null，调用方回退。
+     */
+    function inferLuminanceFromDataUrl(dataUrl) {
+      return new Promise(function (resolve) {
+        try {
+          var img = new Image()
+          img.onload = function () {
+            try {
+              var size = 16
+              var canvas = document.createElement('canvas')
+              canvas.width = size
+              canvas.height = size
+              var ctx = canvas.getContext('2d')
+              if (ctx === null) { resolve(null); return }
+              ctx.drawImage(img, 0, 0, size, size)
+              var px = ctx.getImageData(0, 0, size, size).data
+              var sum = 0, weight = 0
+              for (var k = 0; k < px.length; k += 4) {
+                var a = px[k + 3] / 255
+                if (a < 0.1) continue
+                var lum = (0.2126 * px[k] + 0.7152 * px[k + 1] + 0.0722 * px[k + 2]) / 255
+                sum += lum * a
+                weight += a
+              }
+              if (weight === 0) { resolve(null); return }
+              resolve(Math.round((sum / weight) * 1000) / 1000)
+            } catch (_e) { resolve(null) }
+          }
+          img.onerror = function () { resolve(null) }
+          img.src = dataUrl
+        } catch (_e) { resolve(null) }
+      })
+    }
+
+    /* 按「实际显示效果」判定明暗（方案 B）。
+     *
+     * 有效亮度 = 图亮度 × opacity + 底层亮度 × (1 - opacity)
+     * 但底层色取决于 surface(light/dark)，与判定本身构成循环依赖。
+     * 解法：两个假设各算一遍，一致才采用；不一致说明落在临界区，回退 null。
+     */
+    function resolveTone(luminance, opacity) {
+      if (typeof luminance !== 'number' || !isFinite(luminance)) return null
+      var alpha = Number(opacity)
+      if (!isFinite(alpha)) alpha = 0.88
+      alpha = Math.min(1, Math.max(0, alpha))
+      var LIGHT_BASE = 1.0    // rgb(255,255,255)
+      var DARK_BASE = 0.08    // rgb(21,21,23)
+      // 假设底层浅色
+      var onLight = luminance * alpha + LIGHT_BASE * (1 - alpha)
+      // 假设底层深色
+      var onDark = luminance * alpha + DARK_BASE * (1 - alpha)
+      var verdictLight = onLight > 0.5 ? 'light' : 'dark'
+      var verdictDark = onDark > 0.5 ? 'light' : 'dark'
+      // 两次结论一致 ⇒ 稳定；不一致 ⇒ 临界区，交给宿主主题
+      return verdictLight === verdictDark ? verdictLight : null
+    }
+
     /* 逐张上传（20261027）。
      * 图库上限 6 张 / 4MB，整体上传虽在服务端 12MB 限制内，但逐张更稳：
      * 单张失败不影响其余，且能即时回填每张的 hash。 */
     function pushOneGalleryItem(item) {
       if (!item || typeof item.id !== 'string' || typeof item.data !== 'string') return Promise.resolve()
       if (item.data.indexOf('data:image/') !== 0) return Promise.resolve()
+      // 先测图片亮度再上传（已有缓存则复用，避免重复解码）
+      var prepare = (typeof item.luminance === 'number')
+        ? Promise.resolve(item.luminance)
+        : inferLuminanceFromDataUrl(item.data)
+      return prepare.then(function (luminance) {
       var payload = {}
       payload[item.id] = item.data
+      if (typeof luminance === 'number' && isFinite(luminance)) payload[item.id + '__lum'] = luminance
       return fetch(GALLERY_UPLOAD_ENDPOINT, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
@@ -221,12 +296,17 @@
           // 回填 hash，供下次启动时跳过下载
           var local = readLocalLibrary()
           var idx = local.findIndex(function (x) { return x && x.id === item.id })
-          if (idx !== -1 && local[idx].hash !== changed[item.id].hash) {
-            local[idx].hash = changed[item.id].hash
-            writeLocalLibrary(local)
+          if (idx !== -1) {
+            var touched = false
+            if (local[idx].hash !== changed[item.id].hash) { local[idx].hash = changed[item.id].hash; touched = true }
+            if (typeof changed[item.id].luminance === 'number' && local[idx].luminance !== changed[item.id].luminance) {
+              local[idx].luminance = changed[item.id].luminance; touched = true
+            }
+            if (touched) writeLocalLibrary(local)
           }
         })
         .catch(function () {})
+      })
     }
 
     function pushGalleryItems(items) {

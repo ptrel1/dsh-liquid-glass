@@ -377,6 +377,7 @@ function install(ctx, initial, pluginConfig) {
     for (const [id, entry] of Object.entries(index)) {
       if (entry && typeof entry.hash === 'string' && typeof entry.ext === 'string') {
         out[id] = { hash: entry.hash, ext: entry.ext, url: GALLERY_FILE_PREFIX + entry.hash + '.' + entry.ext }
+        if (typeof entry.luminance === 'number') out[id].luminance = entry.luminance
       }
     }
     res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
@@ -445,11 +446,29 @@ function install(ctx, initial, pluginConfig) {
       if (parsed === null || typeof parsed !== 'object') throw new Error('expected object of id -> dataUrl')
       const index = await readGalleryIndex()
       const changed = {}
+      // 客户端把图片亮度以 "<id>__lum" 附加在同一 payload 里（20261027）。
+ // 单独摘出来，不当作图片条目处理。
+      // 客户端把图片亮度以 "<id>__lum" 附加在 payload 里（20261027 方案 B）。
+      // 存亮度而非 tone：tone 依赖用户当前的不透明度，只能在渲染时才算得准。
+      const lums = {}
+      for (const [key, value] of Object.entries(parsed)) {
+        if (key.endsWith('__lum')) {
+          const id = key.slice(0, -5)
+          if (/^[A-Za-z0-9_-]{1,64}$/.test(id) && typeof value === 'number' && isFinite(value)) {
+            lums[id] = Math.min(1, Math.max(0, value))
+          }
+        }
+      }
       for (const [id, dataUrl] of Object.entries(parsed)) {
+        if (id.endsWith('__lum') || id.endsWith('__tone')) continue
         if (!/^[A-Za-z0-9_-]{1,64}$/.test(id)) continue
         const stored = await storeWallpaper(dataUrl)
-        index[id] = stored
-        changed[id] = { ...stored, url: GALLERY_FILE_PREFIX + stored.hash + '.' + stored.ext }
+        // 保留已有 tone（客户端没传时不要抹掉，否则重传会丢色调）
+        const luminance = (typeof lums[id] === 'number')
+          ? lums[id]
+          : (index[id] && typeof index[id].luminance === 'number' ? index[id].luminance : undefined)
+        index[id] = (typeof luminance === 'number') ? { ...stored, luminance } : stored
+        changed[id] = { ...index[id], url: GALLERY_FILE_PREFIX + stored.hash + '.' + stored.ext }
       }
       await writeGalleryIndex(index)
       send(200, changed)
