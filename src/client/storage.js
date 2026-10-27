@@ -186,16 +186,20 @@
             )
           })
 
-          // ③ 本地有、服务端没有的条目 → 上传（存量迁移的关键一步）
-          var uploads = local.filter(function (item) {
-            return item && typeof item.id === 'string' && typeof item.data === 'string'
-              && item.data.indexOf('data:image/') === 0
-              && index[item.id] === undefined
-          })
-
           return Promise.all(downloads)
             .then(function () { writeLocalLibrary(local) })
             .then(function () {
+              // ③ 上传「服务端缺亮度」或「服务端完全没有」的条目。
+              // ⚠️ 必须在 downloads 完成、且 local 已写回之后再算：
+              //    旧实现在下载前就算 uploads，此时新下载的条目 data 刚落进 local，
+              //    但过滤用的是旧 local 快照 ⇒ 永远筛不出东西（20261027 实测踩坑）。
+              var uploads = local.filter(function (item) {
+                if (!item || typeof item.id !== 'string' || typeof item.data !== 'string') return false
+                if (item.data.indexOf('data:image/') !== 0) return false
+                var remote = index[item.id]
+                if (remote === undefined) return true                   // 服务端完全没有
+                return typeof remote.luminance !== 'number'             // 服务端缺亮度
+              })
               if (uploads.length === 0) return
               return pushGalleryItems(uploads)
             })
