@@ -2,6 +2,18 @@
     function apply(ctx) {
       var theme = ctx.get('theme')
       if (theme === undefined) return
+      // 20261027：先拉服务端配置再建控制器 —— 保证首帧就用对的值，
+      // 避免"先用本地值渲染、再被服务端值纠正"造成闪烁。
+      // 服务端不可用时 loadServerConfig 内部静默回退到 localStorage。
+      var pending = (typeof loadServerConfig === 'function') ? loadServerConfig() : null
+      if (pending !== null && typeof pending.then === 'function') {
+        pending.then(function () { boot(ctx, theme) }, function () { boot(ctx, theme) })
+        return
+      }
+      boot(ctx, theme)
+    }
+
+    function boot(ctx, theme) {
       var controller = createController()
       var dispose = runWithRollback([
         function () { return controller.installStyles() },
