@@ -33,6 +33,25 @@
       return String(v)
     }
 
+    /* 把服务端配置写入 localStorage（P1 修复）。
+     *
+     * ⚠️ 早期 pullConfig() 只更新内存里的 serverConfig，不落本地。
+     *    而 readCustomLibrary()、readBackgroundState() 等处直接读 localStorage，
+     *    于是远端变更对这些地方不可见 —— 表现为「另一台设备改了图，这边不认」。
+     *
+     * 注意：仅回填「服务端有值」的字段，不用空值覆盖本地（避免把本地默认抹掉）。
+     */
+    function persistServerConfigToLocal(cfg) {
+      if (cfg === null || typeof cfg !== 'object') return
+      Object.keys(SERVER_KEY_MAP).forEach(function (localKey) {
+        var field = SERVER_KEY_MAP[localKey]
+        var v = cfg[field]
+        if (v === undefined || v === null) return
+        if (field === 'effect' && v === '') return   // 空 effect 表示未设置
+        try { window.localStorage.setItem(localKey, String(v)) } catch (_e) {}
+      })
+    }
+
     function storageGet(key) {
       var fromServer = serverValueOf(key)
       if (fromServer !== undefined) return fromServer
@@ -47,28 +66,6 @@
       } catch (_error) { /* 本地写失败不阻塞上报 */ }
       pushServerConfig(key, value)
       return true
-    }
-
-    /* 待发送队列：serverConfig 尚未加载完成时，写入先入队，加载后补发。
-     * ⚠️ 旧实现直接 return 丢弃 —— 页面加载后到 loadServerConfig() 返回前
-     *    （慢网络可能数秒）的所有改动全部丢失，是「改了没同步」的元凶之一。
-     * 用对象而非数组：同一字段多次改动只保留最后一次。
-     */
-    var pendingPatch = {}
-    var pendingReady = false
-
-    function flushPendingPatch() {
-      if (!pendingReady) return
-      var patch = pendingPatch
-      pendingPatch = {}
-      if (Object.keys(patch).length === 0) return
-      try {
-        fetch(CONFIG_ENDPOINT, {
-          method: 'PUT',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify(patch),
-        }).catch(function () {})
-      } catch (_e) {}
     }
 
     function pushServerConfig(key, value) {
@@ -102,8 +99,16 @@
       return fetch(CONFIG_ENDPOINT, { headers: { accept: 'application/json' } })
         .then(function (r) { return r.ok ? r.json() : null })
         .then(function (cfg) {
-          if (cfg === null || typeof cfg !== 'object') return
+          if (cfg === null || typeof cfg !== 'object') {
+            pendingReady = true   // 服务端不可用也要放行队列，否则永久卡死
+            return
+          }
           serverConfig = cfg
+          pendingReady = true
+          // P1：首次加载也要把服务端值落到 localStorage。
+          // 否则 readCustomLibrary()/readBackgroundState() 等直接读 localStorage
+          // 的地方拿不到远端值，表现为「另一台设备改了这边不认」。
+          persistServerConfigToLocal(cfg)
           var empty = Object.keys(SERVER_KEY_MAP).every(function (k) {
             var v = cfg[SERVER_KEY_MAP[k]]
             return v === undefined || v === null || v === ''
@@ -241,74 +246,6 @@
     }
 
     /* 把本地新增的图片上传服务端。仅在用户新导入时调用。 */
-    /* ===== 壁纸亮度测量(20261027) =====
-     * 目的：让自定义壁纸也能决定 UI 明暗，且随「不透明度」变化（方案 B）。
-     *
-     * 为什么存亮度而不是直接存 tone：
-     *   最终视觉 = 图片亮度 × opacity + 底层亮度 × (1 - opacity)
-     *   tone 依赖当前 opacity，而上传时算不出用户日后会调成多少。
-     *   所以只存图片自身亮度（唯一稳定属性），渲染时再按当时 opacity 换算。
-     *
-     * 原理：缩到 16x16 画到 canvas，按 Rec.709 感知亮度加权求均值：
-     *   L = 0.2126*R + 0.7152*G + 0.0722*B
-     * ⚠️ 只在导入时算一次，不在渲染路径上。
-     * ⚠️ canvas 被跨域污染/解码失败时返回 null，调用方回退。
-     */
-    function inferLuminanceFromDataUrl(dataUrl) {
-      return new Promise(function (resolve) {
-        try {
-          var img = new Image()
-          img.onload = function () {
-            try {
-              var size = 16
-              var canvas = document.createElement('canvas')
-              canvas.width = size
-              canvas.height = size
-              var ctx = canvas.getContext('2d')
-              if (ctx === null) { resolve(null); return }
-              ctx.drawImage(img, 0, 0, size, size)
-              var px = ctx.getImageData(0, 0, size, size).data
-              var sum = 0, weight = 0
-              for (var k = 0; k < px.length; k += 4) {
-                var a = px[k + 3] / 255
-                if (a < 0.1) continue
-                var lum = (0.2126 * px[k] + 0.7152 * px[k + 1] + 0.0722 * px[k + 2]) / 255
-                sum += lum * a
-                weight += a
-              }
-              if (weight === 0) { resolve(null); return }
-              resolve(Math.round((sum / weight) * 1000) / 1000)
-            } catch (_e) { resolve(null) }
-          }
-          img.onerror = function () { resolve(null) }
-          img.src = dataUrl
-        } catch (_e) { resolve(null) }
-      })
-    }
-
-    /* 按「实际显示效果」判定明暗（方案 B）。
-     *
-     * 有效亮度 = 图亮度 × opacity + 底层亮度 × (1 - opacity)
-     * 但底层色取决于 surface(light/dark)，与判定本身构成循环依赖。
-     * 解法：两个假设各算一遍，一致才采用；不一致说明落在临界区，回退 null。
-     */
-    function resolveTone(luminance, opacity) {
-      if (typeof luminance !== 'number' || !isFinite(luminance)) return null
-      var alpha = Number(opacity)
-      if (!isFinite(alpha)) alpha = 0.88
-      alpha = Math.min(1, Math.max(0, alpha))
-      var LIGHT_BASE = 1.0    // rgb(255,255,255)
-      var DARK_BASE = 0.08    // rgb(21,21,23)
-      // 假设底层浅色
-      var onLight = luminance * alpha + LIGHT_BASE * (1 - alpha)
-      // 假设底层深色
-      var onDark = luminance * alpha + DARK_BASE * (1 - alpha)
-      var verdictLight = onLight > 0.5 ? 'light' : 'dark'
-      var verdictDark = onDark > 0.5 ? 'light' : 'dark'
-      // 两次结论一致 ⇒ 稳定；不一致 ⇒ 临界区，交给宿主主题
-      return verdictLight === verdictDark ? verdictLight : null
-    }
-
     /* 逐张上传（20261027）。
      * 图库上限 6 张 / 4MB，整体上传虽在服务端 12MB 限制内，但逐张更稳：
      * 单张失败不影响其余，且能即时回填每张的 hash。 */
@@ -354,64 +291,6 @@
         chain = chain.then(function () { return pushOneGalleryItem(item) })
       })
       return chain
-    }
-
-    /* ===== 跨设备变更探测(20261027) =====
-     * 每 2s 用 GET 探一次 revision（只回一个整数），变了才拉全量配置。
-     * 变更后通过 onRemoteConfigChange 回调通知上层刷新 UI。
-     * 页面隐藏时暂停轮询（移动端切后台省电），可见时立即探一次。
-     */
-    var REVISION_ENDPOINT = '/api/dsh-liquid-glass/revision'
-    var lastRevision = null
-    var pollTimer = null
-    var remoteListeners = []
-    var POLL_INTERVAL_MS = 2000
-
-    function onRemoteConfigChange(fn) {
-      if (typeof fn === 'function') remoteListeners.push(fn)
-    }
-
-    function emitRemoteChange(cfg) {
-      for (var i = 0; i < remoteListeners.length; i++) {
-        try { remoteListeners[i](cfg) } catch (_e) {}
-      }
-    }
-
-    function pullConfig() {
-      return fetch(CONFIG_ENDPOINT, { headers: { accept: 'application/json' } })
-        .then(function (r) { return r.ok ? r.json() : null })
-        .then(function (cfg) {
-          if (cfg === null || typeof cfg !== 'object') return
-          var rev = cfg.__revision
-          delete cfg.__revision
-          if (rev !== undefined) lastRevision = rev
-          serverConfig = cfg
-          emitRemoteChange(cfg)
-        })
-        .catch(function () {})
-    }
-
-    function pollOnce() {
-      if (document && document.hidden) return Promise.resolve()
-      return fetch(REVISION_ENDPOINT, { headers: { accept: 'application/json' } })
-        .then(function (r) { return r.ok ? r.json() : null })
-        .then(function (data) {
-          if (data === null || typeof data.revision !== 'number') return
-          if (lastRevision === null) { lastRevision = data.revision; return }
-          if (data.revision === lastRevision) return
-          return pullConfig()   // 只有变了才拉全量
-        })
-        .catch(function () {})
-    }
-
-    function startRevisionPolling() {
-      if (pollTimer !== null) return
-      pollTimer = setInterval(function () { pollOnce() }, POLL_INTERVAL_MS)
-      if (document && typeof document.addEventListener === 'function') {
-        document.addEventListener('visibilitychange', function () {
-          if (!document.hidden) pollOnce()   // 回到前台立即探一次
-        })
-      }
     }
 
     function clamp(value, min, max, fallback) {
