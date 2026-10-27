@@ -138,9 +138,17 @@
       } catch (_e) {}
     }
 
-    /* 拉索引 + 补齐本地缺失的图片。
-     * 先把索引里新出现的 id 拉成 data URL 写回本地图库；
-     * 本地已有同 hash 的条目直接跳过（避免重复下载）。 */
+    /* 图库双向同步。
+     *
+     * ⚠️ 20261027 修正：原实现只做「服务端 → 本地」单向下载，
+     * 导致改造前就存在的本地图片永远传不上去（服务端索引恒为空，
+     * 于是看起来"没同步"）。现改为双向：
+     *
+     *   ① 拉服务端索引
+     *   ② 服务端有、本地无（或 hash 不同）→ 下载到本地
+     *   ③ 本地有、服务端无 → 上传到服务端   ← 原先缺失的一步
+     *   ④ 两边都有且 hash 相同 → 跳过（避免重复传输）
+     */
     function syncGallery() {
       return fetch(GALLERY_INDEX_ENDPOINT, { headers: { accept: 'application/json' } })
         .then(function (r) { return r.ok ? r.json() : null })
@@ -151,14 +159,14 @@
           var byId = {}
           local.forEach(function (item) { if (item && item.id) byId[item.id] = item })
 
-          var tasks = []
+          var downloads = []
           Object.keys(index).forEach(function (id) {
             var entry = index[id]
             if (!entry || !entry.url) return
             var existing = byId[id]
             // 已有同 hash 的本地副本 → 跳过下载
             if (existing && existing.hash === entry.hash && existing.data) return
-            tasks.push(
+            downloads.push(
               fetch(entry.url).then(function (r) { return r.ok ? r.blob() : null }).then(function (blob) {
                 if (blob === null) return
                 return new Promise(function (resolve) {
@@ -176,35 +184,117 @@
               }).catch(function () {})
             )
           })
-          return Promise.all(tasks).then(function () { writeLocalLibrary(local) })
+
+          // ③ 本地有、服务端没有的条目 → 上传（存量迁移的关键一步）
+          var uploads = local.filter(function (item) {
+            return item && typeof item.id === 'string' && typeof item.data === 'string'
+              && item.data.indexOf('data:image/') === 0
+              && index[item.id] === undefined
+          })
+
+          return Promise.all(downloads)
+            .then(function () { writeLocalLibrary(local) })
+            .then(function () {
+              if (uploads.length === 0) return
+              return pushGalleryItems(uploads)
+            })
         })
         .catch(function () {})
     }
 
     /* 把本地新增的图片上传服务端。仅在用户新导入时调用。 */
-    function pushGalleryItems(items) {
-      if (!items || items.length === 0) return Promise.resolve()
+    /* 逐张上传（20261027）。
+     * 图库上限 6 张 / 4MB，整体上传虽在服务端 12MB 限制内，但逐张更稳：
+     * 单张失败不影响其余，且能即时回填每张的 hash。 */
+    function pushOneGalleryItem(item) {
+      if (!item || typeof item.id !== 'string' || typeof item.data !== 'string') return Promise.resolve()
+      if (item.data.indexOf('data:image/') !== 0) return Promise.resolve()
       var payload = {}
-      items.forEach(function (item) {
-        if (item && typeof item.id === 'string' && typeof item.data === 'string') payload[item.id] = item.data
-      })
-      if (Object.keys(payload).length === 0) return Promise.resolve()
+      payload[item.id] = item.data
       return fetch(GALLERY_UPLOAD_ENDPOINT, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(payload),
       }).then(function (r) { return r.ok ? r.json() : null })
         .then(function (changed) {
-          if (!changed || typeof changed !== 'object') return
+          if (!changed || typeof changed !== 'object' || !changed[item.id]) return
           // 回填 hash，供下次启动时跳过下载
           var local = readLocalLibrary()
-          var touched = false
-          local.forEach(function (item) {
-            if (item && changed[item.id] && changed[item.id].hash) { item.hash = changed[item.id].hash; touched = true }
-          })
-          if (touched) writeLocalLibrary(local)
+          var idx = local.findIndex(function (x) { return x && x.id === item.id })
+          if (idx !== -1 && local[idx].hash !== changed[item.id].hash) {
+            local[idx].hash = changed[item.id].hash
+            writeLocalLibrary(local)
+          }
         })
         .catch(function () {})
+    }
+
+    function pushGalleryItems(items) {
+      if (!items || items.length === 0) return Promise.resolve()
+      // 串行上传，避免并发写 index.json 互相覆盖
+      var chain = Promise.resolve()
+      items.forEach(function (item) {
+        chain = chain.then(function () { return pushOneGalleryItem(item) })
+      })
+      return chain
+    }
+
+    /* ===== 跨设备变更探测(20261027) =====
+     * 每 2s 用 GET 探一次 revision（只回一个整数），变了才拉全量配置。
+     * 变更后通过 onRemoteConfigChange 回调通知上层刷新 UI。
+     * 页面隐藏时暂停轮询（移动端切后台省电），可见时立即探一次。
+     */
+    var REVISION_ENDPOINT = '/api/dsh-liquid-glass/revision'
+    var lastRevision = null
+    var pollTimer = null
+    var remoteListeners = []
+    var POLL_INTERVAL_MS = 2000
+
+    function onRemoteConfigChange(fn) {
+      if (typeof fn === 'function') remoteListeners.push(fn)
+    }
+
+    function emitRemoteChange(cfg) {
+      for (var i = 0; i < remoteListeners.length; i++) {
+        try { remoteListeners[i](cfg) } catch (_e) {}
+      }
+    }
+
+    function pullConfig() {
+      return fetch(CONFIG_ENDPOINT, { headers: { accept: 'application/json' } })
+        .then(function (r) { return r.ok ? r.json() : null })
+        .then(function (cfg) {
+          if (cfg === null || typeof cfg !== 'object') return
+          var rev = cfg.__revision
+          delete cfg.__revision
+          if (rev !== undefined) lastRevision = rev
+          serverConfig = cfg
+          emitRemoteChange(cfg)
+        })
+        .catch(function () {})
+    }
+
+    function pollOnce() {
+      if (document && document.hidden) return Promise.resolve()
+      return fetch(REVISION_ENDPOINT, { headers: { accept: 'application/json' } })
+        .then(function (r) { return r.ok ? r.json() : null })
+        .then(function (data) {
+          if (data === null || typeof data.revision !== 'number') return
+          if (lastRevision === null) { lastRevision = data.revision; return }
+          if (data.revision === lastRevision) return
+          return pullConfig()   // 只有变了才拉全量
+        })
+        .catch(function () {})
+    }
+
+    function startRevisionPolling() {
+      if (pollTimer !== null) return
+      pollTimer = setInterval(function () { pollOnce() }, POLL_INTERVAL_MS)
+      if (document && typeof document.addEventListener === 'function') {
+        document.addEventListener('visibilitychange', function () {
+          if (!document.hidden) pollOnce()   // 回到前台立即探一次
+        })
+      }
     }
 
     function clamp(value, min, max, fallback) {

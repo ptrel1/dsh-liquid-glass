@@ -63,6 +63,20 @@
             )
           })
         },
+        function () {
+          // 20261027：跨设备变更探测。每 2s 探一次 revision，变了才拉全量配置。
+          // 收到变更后就地重放氛围与设置面板，无需刷新页面。
+          if (typeof onRemoteConfigChange !== 'function' || typeof startRevisionPolling !== 'function') return undefined
+          onRemoteConfigChange(function () {
+            try {
+              applyBoundWallpaper(theme)
+              controller.applyAtmosphere(theme)
+              controller.notifySettings()
+            } catch (_error) {}
+          })
+          startRevisionPolling()
+          return undefined
+        },
       ])
       ctx.effect(function () { return dispose })
     }

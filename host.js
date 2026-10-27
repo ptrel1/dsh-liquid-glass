@@ -64,6 +64,7 @@ const CONFIG_ROUTE = '/api/dsh-liquid-glass/config'
 export const GALLERY_INDEX_ROUTE = '/api/dsh-liquid-glass/wallpapers/index'
 export const GALLERY_UPLOAD_ROUTE = '/api/dsh-liquid-glass/wallpapers/upload'
 export const GALLERY_FILE_PREFIX = '/api/dsh-liquid-glass/wallpapers/file/'
+export const REVISION_ROUTE = '/api/dsh-liquid-glass/revision'
 
 /* 配置持久化：$DSH_HOME/liquid-glass/config.json
  *
@@ -302,13 +303,36 @@ function install(ctx, initial, pluginConfig) {
    * GET  返回当前生效配置（供 client 初始化）
    * PUT  合并 patch 并持久化到 profile 配置（settings.update）
    * 说明：client 侧仍需保留 localStorage 作为「旧配置迁移」与「读取失败时的回退」。 */
+  /* ===== 轻量版本号轮询(20261027) =====
+   * 目标：设备 A 改配置 → 设备 B 不刷新也能生效。
+   * 做法：服务端维护一个单调递增的 revision；客户端每 2s 用 GET 探测，
+   *       值变了才去拉全量配置（几十字节 vs 全量 JSON）。
+   * 为什么不用 SSE：移动端切后台/切网络会断长连接，需写重连逻辑；
+   *                 轮询更简单稳当，空闲开销也可接受（每 2s 一次 304 级响应）。
+   */
+  let configRevision = 1
+
+  const revisionHandler = (req, res) => {
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      res.writeHead(405, { allow: 'GET, HEAD' })
+      res.end()
+      return
+    }
+    // 只回一个整数，体积可忽略；no-store 防止中间层缓存导致轮询失效
+    res.writeHead(200, {
+      'content-type': 'application/json; charset=utf-8',
+      'cache-control': 'no-store',
+    })
+    res.end(JSON.stringify({ revision: configRevision }))
+  }
+
   const configHandler = async (req, res) => {
     const send = (status, value) => {
       res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
       res.end(JSON.stringify(value))
     }
     if (req.method === 'GET' || req.method === 'HEAD') {
-      send(200, current)
+      send(200, { ...current, __revision: configRevision })
       return
     }
     if (req.method !== 'PUT') {
@@ -334,6 +358,7 @@ function install(ctx, initial, pluginConfig) {
       }
       current = { ...current, ...patch }
       await writeConfigFile(current)
+      configRevision += 1   // 让其他客户端的轮询探测到变更
       send(200, current)
     } catch (error) {
       send(400, { error: String(error && error.message ? error.message : error) })
@@ -447,6 +472,7 @@ function install(ctx, initial, pluginConfig) {
       handler: ice,
     })),
     ctx.webServer.register({ kind: 'exact', path: CONFIG_ROUTE, handler: configHandler }),
+    ctx.webServer.register({ kind: 'exact', path: REVISION_ROUTE, handler: revisionHandler }),
     ctx.webServer.register({ kind: 'exact', path: GALLERY_INDEX_ROUTE, handler: galleryIndexHandler }),
     ctx.webServer.register({ kind: 'exact', path: GALLERY_UPLOAD_ROUTE, handler: galleryUploadHandler }),
     // 取图用 prefix：URL 含内容哈希，路径无法预先枚举
