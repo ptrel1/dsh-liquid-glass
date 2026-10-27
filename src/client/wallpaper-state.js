@@ -189,9 +189,11 @@
         if (!canPersistLibrary(library, null)) return false
       }
 
+      /* 20261027：改用 storageSet —— 它会「写本地 + 上报服务端」。
+       * 原来直接调 window.localStorage.setItem，绕过了服务端上报，
+       * 导致壁纸透明度只改本地，而 storageGet 优先读服务端旧值 ⇒ 滑杆动了没反应。 */
       function write(key, value) {
-        if (value === null) window.localStorage.removeItem(key)
-        else window.localStorage.setItem(key, value)
+        storageSet(key, value)
       }
 
       try {

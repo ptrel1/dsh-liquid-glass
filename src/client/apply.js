@@ -6,6 +6,8 @@
       // 避免"先用本地值渲染、再被服务端值纠正"造成闪烁。
       // 服务端不可用时 loadServerConfig 内部静默回退到 localStorage。
       var pending = (typeof loadServerConfig === 'function') ? loadServerConfig() : null
+      // 图库同步与配置拉取并行；不阻塞首帧（图片到位后由 controller 自行刷新）。
+      if (typeof syncGallery === 'function') syncGallery()
       if (pending !== null && typeof pending.then === 'function') {
         pending.then(function () { boot(ctx, theme) }, function () { boot(ctx, theme) })
         return

@@ -971,7 +971,107 @@ body[data-dsh-liquid-glass] [role='dialog'] button:disabled {
         .catch(function () {})
     }
 
-        function clamp(value, min, max, fallback) {
+        /* ===== 图库同步(20261027) =====
+     *
+     * 自定义壁纸图片存服务端，跨设备共享。为免每次全量下载：
+     *   ① 先拉索引（很小），拿到 { id: { hash, ext, url } }
+     *   ② url 内含内容哈希 ⇒ 浏览器强缓存，第二次起零网络
+     *   ③ 本地 localStorage 保留一份副本：服务端不可达时仍能渲染，
+     *      且命中本地副本时无需等网络
+     */
+    var GALLERY_INDEX_ENDPOINT = '/api/dsh-liquid-glass/wallpapers/index'
+    var GALLERY_UPLOAD_ENDPOINT = '/api/dsh-liquid-glass/wallpapers/upload'
+    var CUSTOM_LIBRARY_KEY = 'dsh-liquid-glass.background.customs'
+    var CUSTOM_SINGLE_KEY = 'dsh-liquid-glass.background.custom'
+    var galleryIndex = null
+
+    function readLocalLibrary() {
+      var raw
+      try { raw = window.localStorage.getItem(CUSTOM_LIBRARY_KEY) } catch (_e) { return [] }
+      if (!raw) return []
+      try {
+        var parsed = JSON.parse(raw)
+        return Array.isArray(parsed) ? parsed : []
+      } catch (_e) { return [] }
+    }
+
+    function writeLocalLibrary(list) {
+      try {
+        if (!list || list.length === 0) window.localStorage.removeItem(CUSTOM_LIBRARY_KEY)
+        else window.localStorage.setItem(CUSTOM_LIBRARY_KEY, JSON.stringify(list))
+      } catch (_e) {}
+    }
+
+    /* 拉索引 + 补齐本地缺失的图片。
+     * 先把索引里新出现的 id 拉成 data URL 写回本地图库；
+     * 本地已有同 hash 的条目直接跳过（避免重复下载）。 */
+    function syncGallery() {
+      return fetch(GALLERY_INDEX_ENDPOINT, { headers: { accept: 'application/json' } })
+        .then(function (r) { return r.ok ? r.json() : null })
+        .then(function (index) {
+          if (index === null || typeof index !== 'object') return
+          galleryIndex = index
+          var local = readLocalLibrary()
+          var byId = {}
+          local.forEach(function (item) { if (item && item.id) byId[item.id] = item })
+
+          var tasks = []
+          Object.keys(index).forEach(function (id) {
+            var entry = index[id]
+            if (!entry || !entry.url) return
+            var existing = byId[id]
+            // 已有同 hash 的本地副本 → 跳过下载
+            if (existing && existing.hash === entry.hash && existing.data) return
+            tasks.push(
+              fetch(entry.url).then(function (r) { return r.ok ? r.blob() : null }).then(function (blob) {
+                if (blob === null) return
+                return new Promise(function (resolve) {
+                  var reader = new FileReader()
+                  reader.onload = function () { resolve(String(reader.result || '')) }
+                  reader.onerror = function () { resolve(null) }
+                  reader.readAsDataURL(blob)
+                }).then(function (dataUrl) {
+                  if (!dataUrl) return
+                  var idx = local.findIndex(function (x) { return x && x.id === id })
+                  var item = { id: id, data: dataUrl, hash: entry.hash }
+                  if (idx === -1) local.push(item)
+                  else local[idx] = item
+                })
+              }).catch(function () {})
+            )
+          })
+          return Promise.all(tasks).then(function () { writeLocalLibrary(local) })
+        })
+        .catch(function () {})
+    }
+
+    /* 把本地新增的图片上传服务端。仅在用户新导入时调用。 */
+    function pushGalleryItems(items) {
+      if (!items || items.length === 0) return Promise.resolve()
+      var payload = {}
+      items.forEach(function (item) {
+        if (item && typeof item.id === 'string' && typeof item.data === 'string') payload[item.id] = item.data
+      })
+      if (Object.keys(payload).length === 0) return Promise.resolve()
+      return fetch(GALLERY_UPLOAD_ENDPOINT, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(payload),
+      }).then(function (r) { return r.ok ? r.json() : null })
+        .then(function (changed) {
+          if (!changed || typeof changed !== 'object') return
+          // 回填 hash，供下次启动时跳过下载
+          var local = readLocalLibrary()
+          var touched = false
+          local.forEach(function (item) {
+            if (item && changed[item.id] && changed[item.id].hash) { item.hash = changed[item.id].hash; touched = true }
+          })
+          if (touched) writeLocalLibrary(local)
+        })
+        .catch(function () {})
+    }
+
+    function clamp(value, min, max, fallback) {
       return Number.isFinite(value) ? Math.min(max, Math.max(min, value)) : fallback
     }
 
@@ -1242,9 +1342,11 @@ body[data-dsh-liquid-glass] [role='dialog'] button:disabled {
         if (!canPersistLibrary(library, null)) return false
       }
 
+      /* 20261027：改用 storageSet —— 它会「写本地 + 上报服务端」。
+       * 原来直接调 window.localStorage.setItem，绕过了服务端上报，
+       * 导致壁纸透明度只改本地，而 storageGet 优先读服务端旧值 ⇒ 滑杆动了没反应。 */
       function write(key, value) {
-        if (value === null) window.localStorage.removeItem(key)
-        else window.localStorage.setItem(key, value)
+        storageSet(key, value)
       }
 
       try {
@@ -2442,6 +2544,9 @@ body[data-dsh-liquid-glass] [role='dialog'] button:disabled {
               opacity: background.opacity,
             }
             var persisted = saveBackgroundState(next.id, next.custom, next.opacity, library)
+            // 20261027：导入成功后把新图上传服务端，供其他设备同步。
+            // 失败不影响本地使用（本地副本已生效），静默忽略。
+            if (typeof pushGalleryItems === 'function') pushGalleryItems([item])
             refresh({ background: next }, failStatus(persisted))
           })
           return importBag.chain
@@ -3147,6 +3252,8 @@ body[data-dsh-liquid-glass] [role='dialog'] button:disabled {
       // 避免"先用本地值渲染、再被服务端值纠正"造成闪烁。
       // 服务端不可用时 loadServerConfig 内部静默回退到 localStorage。
       var pending = (typeof loadServerConfig === 'function') ? loadServerConfig() : null
+      // 图库同步与配置拉取并行；不阻塞首帧（图片到位后由 controller 自行刷新）。
+      if (typeof syncGallery === 'function') syncGallery()
       if (pending !== null && typeof pending.then === 'function') {
         pending.then(function () { boot(ctx, theme) }, function () { boot(ctx, theme) })
         return

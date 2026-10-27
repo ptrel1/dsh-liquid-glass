@@ -1,7 +1,8 @@
 // dsh-liquid-glass —— Node host half
 // Serves the bundled preview wallpaper without exposing arbitrary filesystem paths.
 
-import { readFile, mkdir, rename, writeFile } from 'node:fs/promises'
+import { readFile, mkdir, rename, writeFile, readdir, unlink } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
 import { dirname, join } from 'node:path'
 import { homedir } from 'node:os'
 import z from '@deepseek-ai/schemastery'
@@ -51,7 +52,18 @@ const pickConfigKeys = (input) => {
   return picked
 }
 
+const MIME_BY_EXT = {
+  png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif',
+  webp: 'image/webp', avif: 'image/avif', bmp: 'image/bmp', svg: 'image/svg+xml',
+}
+function mimeForExt(ext) {
+  return MIME_BY_EXT[String(ext).toLowerCase()] || 'application/octet-stream'
+}
+
 const CONFIG_ROUTE = '/api/dsh-liquid-glass/config'
+export const GALLERY_INDEX_ROUTE = '/api/dsh-liquid-glass/wallpapers/index'
+export const GALLERY_UPLOAD_ROUTE = '/api/dsh-liquid-glass/wallpapers/upload'
+export const GALLERY_FILE_PREFIX = '/api/dsh-liquid-glass/wallpapers/file/'
 
 /* 配置持久化：$DSH_HOME/liquid-glass/config.json
  *
@@ -71,6 +83,84 @@ async function readConfigFile() {
     return parsed && typeof parsed === 'object' ? parsed : {}
   } catch (_error) {
     return {}  // 文件不存在 / 损坏 → 视为空，走默认值
+  }
+}
+
+/* ===== 图库持久化(20261027) =====
+ *
+ * 自定义壁纸图片存服务端，跨设备共享。为避免每次全量下载，采用：
+ *   ① 图片按内容 sha256 前缀命名 ⇒ URL 内含内容指纹
+ *   ② 该 URL 设 cache-control: immutable（照抄本插件预设壁纸的做法）
+ *   ③ 内容变 ⇒ 哈希变 ⇒ URL 变 ⇒ 浏览器自动失效重取
+ *   ④ 客户端另留一份 localStorage 副本，服务端不可达时仍可渲染
+ *
+ * 目录结构：
+ *   $DSH_HOME/liquid-glass/wallpapers/
+ *     ├── index.json          { "<id>": { "hash": "...", "ext": "jpg" } }
+ *     └── <hash>.<ext>        原图
+ */
+export function wallpapersDir() {
+  const home = process.env.DSH_HOME || join(homedir(), '.dsh')
+  return join(home, 'liquid-glass', 'wallpapers')
+}
+
+function galleryIndexPath() {
+  return join(wallpapersDir(), 'index.json')
+}
+
+async function readGalleryIndex() {
+  try {
+    const raw = await readFile(galleryIndexPath(), 'utf8')
+    const parsed = JSON.parse(raw)
+    return parsed && typeof parsed === 'object' ? parsed : {}
+  } catch (_error) {
+    return {}
+  }
+}
+
+async function writeGalleryIndex(index) {
+  await mkdir(wallpapersDir(), { recursive: true })
+  const target = galleryIndexPath()
+  const tmp = target + '.' + process.pid + '.' + Date.now() + '.tmp'
+  await writeFile(tmp, JSON.stringify(index, null, 2) + '\n', 'utf8')
+  await rename(tmp, target)
+}
+
+/** 从 data URL 解析出 mime 与二进制。返回 null 表示格式不认识。 */
+function decodeDataUrl(dataUrl) {
+  if (typeof dataUrl !== 'string') return null
+  const match = /^data:image\/([a-z0-9+.-]+);base64,(.+)$/i.exec(dataUrl)
+  if (match === null) return null
+  const ext = match[1].toLowerCase().replace('jpeg', 'jpg').replace('svg+xml', 'svg')
+  return { ext, buffer: Buffer.from(match[2], 'base64') }
+}
+
+/** 存一张图，返回 { hash, ext }。同内容重复上传会复用同一文件。 */
+async function storeWallpaper(dataUrl) {
+  const decoded = decodeDataUrl(dataUrl)
+  if (decoded === null) throw new Error('invalid image data url')
+  const hash = createHash('sha256').update(decoded.buffer).digest('hex').slice(0, 32)
+  const dir = wallpapersDir()
+  await mkdir(dir, { recursive: true })
+  const file = join(dir, hash + '.' + decoded.ext)
+  try {
+    await readFile(file)   // 已存在则跳过写盘
+  } catch (_error) {
+    const tmp = file + '.' + process.pid + '.tmp'
+    await writeFile(tmp, decoded.buffer)
+    await rename(tmp, file)
+  }
+  return { hash, ext: decoded.ext }
+}
+
+async function readWallpaperBytes(hash, ext) {
+  // hash 只允许十六进制，防止路径穿越
+  if (!/^[a-f0-9]{8,64}$/.test(hash)) return null
+  if (!/^(png|jpg|jpeg|gif|webp|avif|bmp|svg)$/.test(ext)) return null
+  try {
+    return await readFile(join(wallpapersDir(), hash + '.' + ext))
+  } catch (_error) {
+    return null
   }
 }
 
@@ -231,7 +321,9 @@ function install(ctx, initial, pluginConfig) {
       let size = 0
       for await (const chunk of req) {
         size += chunk.length
-        if (size > 64 * 1024) throw new Error('payload too large')
+        // 20261027：原 64KB 过小。自定义壁纸是 base64 data URL（单张上限 2MB，
+        // 图库总上限 4MB），此处放宽到 8MB 留余量。仅本插件配置，不影响其他接口。
+        if (size > 8 * 1024 * 1024) throw new Error('payload too large')
         chunks.push(chunk)
       }
       const parsed = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')
@@ -243,6 +335,99 @@ function install(ctx, initial, pluginConfig) {
       current = { ...current, ...patch }
       await writeConfigFile(current)
       send(200, current)
+    } catch (error) {
+      send(400, { error: String(error && error.message ? error.message : error) })
+    }
+  }
+
+  /* 图库索引：{ "<id>": { hash, ext, url } }。体积小，每次启动拉一次。 */
+  const galleryIndexHandler = async (req, res) => {
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      res.writeHead(405, { allow: 'GET, HEAD' })
+      res.end()
+      return
+    }
+    const index = await readGalleryIndex()
+    const out = {}
+    for (const [id, entry] of Object.entries(index)) {
+      if (entry && typeof entry.hash === 'string' && typeof entry.ext === 'string') {
+        out[id] = { hash: entry.hash, ext: entry.ext, url: GALLERY_FILE_PREFIX + entry.hash + '.' + entry.ext }
+      }
+    }
+    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+    res.end(JSON.stringify(out))
+  }
+
+  /* 取图。URL 内含内容哈希 ⇒ 可长期强缓存；内容变了 URL 就变，自动失效。 */
+  const galleryFileHandler = async (req, res) => {
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      res.writeHead(405, { allow: 'GET, HEAD' })
+      res.end()
+      return
+    }
+    const rawPath = String((req.url || req.path || '/')).split('?')[0]
+    const tail = rawPath.slice(GALLERY_FILE_PREFIX.length)
+    const dot = tail.lastIndexOf('.')
+    if (dot === -1) {
+      res.writeHead(404)
+      res.end()
+      return
+    }
+    const buffer = await readWallpaperBytes(tail.slice(0, dot), tail.slice(dot + 1))
+    if (buffer === null) {
+      res.writeHead(404)
+      res.end()
+      return
+    }
+    const etag = '"' + tail + '"'
+    const headers = {
+      'content-type': mimeForExt(tail.slice(dot + 1)),
+      'cache-control': 'public, max-age=31536000, immutable',
+      'etag': etag,
+      'content-length': String(buffer.byteLength),
+    }
+    const match = req.headers && (req.headers['if-none-match'] || req.headers['If-None-Match'])
+    if (match === etag) {
+      res.writeHead(304, headers)
+      res.end()
+      return
+    }
+    res.writeHead(200, headers)
+    res.end(req.method === 'HEAD' ? undefined : buffer)
+  }
+
+  /* 上传图库条目。body: { "<id>": "<data:image/...;base64,...>", ... }
+   * 同 id 重复上传会覆盖；内容相同则复用同一文件（按内容哈希）。 */
+  const galleryUploadHandler = async (req, res) => {
+    const send = (status, value) => {
+      res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+      res.end(JSON.stringify(value))
+    }
+    if (req.method !== 'PUT' && req.method !== 'POST') {
+      res.writeHead(405, { allow: 'PUT, POST' })
+      res.end()
+      return
+    }
+    try {
+      const chunks = []
+      let size = 0
+      for await (const chunk of req) {
+        size += chunk.length
+        if (size > 12 * 1024 * 1024) throw new Error('payload too large')
+        chunks.push(chunk)
+      }
+      const parsed = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')
+      if (parsed === null || typeof parsed !== 'object') throw new Error('expected object of id -> dataUrl')
+      const index = await readGalleryIndex()
+      const changed = {}
+      for (const [id, dataUrl] of Object.entries(parsed)) {
+        if (!/^[A-Za-z0-9_-]{1,64}$/.test(id)) continue
+        const stored = await storeWallpaper(dataUrl)
+        index[id] = stored
+        changed[id] = { ...stored, url: GALLERY_FILE_PREFIX + stored.hash + '.' + stored.ext }
+      }
+      await writeGalleryIndex(index)
+      send(200, changed)
     } catch (error) {
       send(400, { error: String(error && error.message ? error.message : error) })
     }
@@ -262,6 +447,10 @@ function install(ctx, initial, pluginConfig) {
       handler: ice,
     })),
     ctx.webServer.register({ kind: 'exact', path: CONFIG_ROUTE, handler: configHandler }),
+    ctx.webServer.register({ kind: 'exact', path: GALLERY_INDEX_ROUTE, handler: galleryIndexHandler }),
+    ctx.webServer.register({ kind: 'exact', path: GALLERY_UPLOAD_ROUTE, handler: galleryUploadHandler }),
+    // 取图用 prefix：URL 含内容哈希，路径无法预先枚举
+    ctx.webServer.register({ kind: 'prefix', path: GALLERY_FILE_PREFIX.replace(/\/$/, ''), handler: galleryFileHandler }),
   ]
   ctx.effect(() => () => {
     for (const dispose of disposers) dispose()
