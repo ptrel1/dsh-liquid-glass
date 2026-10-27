@@ -40,9 +40,22 @@
         var surface = glassOn ? surfaceScheme(theme, background) : scheme
         var fallback = FALLBACK_BASE[surface]
         var hasWallpaper = background.id !== 'none' || background.custom !== null
+        /* 底色不透明度 wash（20261027 修）
+         *
+         * ⚠️ 原实现 glassOn 且有壁纸时硬编码 0.02，隐含假设「壁纸几乎不透明」
+         *    （默认 opacity=0.88）。一旦用户把壁纸不透明度调低（最低 0.35），
+         *    壁纸半透 + 底色全透 = 屏上没有任何实色遮挡，文字直接糊在壁纸上。
+         *
+         * 正确关系：壁纸越透明 → 底色越要实，两者互补，保证总覆盖度稳定。
+         *   opacity=1.00 → wash≈0.02（原行为，壁纸自身足够）
+         *   opacity=0.88 → wash≈0.14
+         *   opacity=0.35 → wash≈0.66（补足遮蔽）
+         * 系数 0.98 而非 1：保留 2% 透光，避免完全失去玻璃感。
+         */
+        var wallpaperOpacity = clamp(opacity, 0.35, 1, DEFAULT_WALLPAPER_OPACITY)
         var wash = glassOn
-          ? (hasWallpaper ? 0.02 : 1)
-          : clamp(opacity, 0.35, 1, DEFAULT_WALLPAPER_OPACITY)
+          ? (hasWallpaper ? (1 - wallpaperOpacity * 0.98) : 1)
+          : wallpaperOpacity
         var base = computedColor('--dsw-alias-bg-base', fallback)
         var sidebar = computedColor('--dsw-specific-sidebar-fill', fallback)
         var baseLight = glassOn ? fallback : (scheme === 'light' ? base : FALLBACK_BASE.light)

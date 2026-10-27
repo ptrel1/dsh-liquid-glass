@@ -49,10 +49,31 @@
       return true
     }
 
+    /* 待发送队列：serverConfig 尚未加载完成时，写入先入队，加载后补发。
+     * ⚠️ 旧实现直接 return 丢弃 —— 页面加载后到 loadServerConfig() 返回前
+     *    （慢网络可能数秒）的所有改动全部丢失，是「改了没同步」的元凶之一。
+     * 用对象而非数组：同一字段多次改动只保留最后一次。
+     */
+    var pendingPatch = {}
+    var pendingReady = false
+
+    function flushPendingPatch() {
+      if (!pendingReady) return
+      var patch = pendingPatch
+      pendingPatch = {}
+      if (Object.keys(patch).length === 0) return
+      try {
+        fetch(CONFIG_ENDPOINT, {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(patch),
+        }).catch(function () {})
+      } catch (_e) {}
+    }
+
     function pushServerConfig(key, value) {
       var field = KEY_TO_SERVER[key]
       if (field === undefined) return
-      if (serverConfig === null) return
       var patch = {}
       if (field === 'glassBlur' || field === 'backgroundOpacity') {
         var num = Number(value)
@@ -60,6 +81,11 @@
         patch[field] = num
       } else {
         patch[field] = value === null ? '' : String(value)
+      }
+      // 还未拿到服务端配置 → 入队，等 loadServerConfig 完成后补发
+      if (serverConfig === null) {
+        for (var k in patch) pendingPatch[k] = patch[k]
+        return
       }
       serverConfig[field] = patch[field]
       try {
@@ -94,17 +120,24 @@
               if (Number.isFinite(num)) patch[field] = num
             } else patch[field] = raw
           })
-          if (Object.keys(patch).length === 0) return
-          Object.keys(patch).forEach(function (f) { serverConfig[f] = patch[f] })
-          try {
-            fetch(CONFIG_ENDPOINT, {
-              method: 'PUT',
-              headers: { 'content-type': 'application/json' },
-              body: JSON.stringify(patch),
-            }).catch(function () {})
-          } catch (_e) {}
+          if (Object.keys(patch).length > 0) {
+            Object.keys(patch).forEach(function (f) { serverConfig[f] = patch[f] })
+            try {
+              fetch(CONFIG_ENDPOINT, {
+                method: 'PUT',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify(patch),
+              }).catch(function () {})
+            } catch (_e) {}
+          }
+          // 补发加载期间攒下的改动（后写覆盖迁移值，符合用户最新意图）
+          flushPendingPatch()
         })
-        .catch(function () {})
+        .catch(function () {
+          // 服务端不可用：放行队列以免永久卡死（本地值已生效）
+          pendingReady = true
+          flushPendingPatch()
+        })
     }
 
         /* ===== 图库同步(20261027) =====
