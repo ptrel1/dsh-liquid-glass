@@ -1,8 +1,16 @@
-# dsh-liquid-glass · DSH 液态玻璃
+# dsh-liquid-glass · DSH 液态玻璃（维护版 fork）
 
 DeepSeek Harness（DSH）Web 皮肤：在官方**浅色 / 深色 / 跟随系统**之上叠加壁纸，以及可选的液态玻璃岛。
 
 对照官方基线：DeepSeek Harness `47f943859bef60e4160492346772ded9b24f765a`。
+
+> ## ⚠️ 这是 fork，不是原版
+>
+> 上游 [xingyingyuzhui/dsh-liquid-glass](https://github.com/xingyingyuzhui/dsh-liquid-glass)
+> 自 2026-08-15（`573a81d`）后**已停更**。本仓库在其基础上修复缺陷并新增能力，
+> **代码已大幅偏离**，不保证与上游行为一致。
+>
+> **安装请用本仓库，不要用上游。** 改动清单见下方「本 fork 的改动」。
 
 ## 预览
 
@@ -27,7 +35,7 @@ DeepSeek Harness（DSH）Web 皮肤：在官方**浅色 / 深色 / 跟随系统*
 前置：已安装 DSH（`dsh web` 可运行）。
 
 ```sh
-dsh plugin --profile web add github:xingyingyuzhui/dsh-liquid-glass
+dsh plugin --profile web add github:ptrel1/dsh-liquid-glass
 ```
 
 装完**重启 DSH**（`dsh web`），然后打开 **设置 → 通用 → Liquid Glass**。
@@ -75,6 +83,46 @@ $DSH_HOME/liquid-glass/wallpapers/
 内容变 ⇒ 哈希变 ⇒ URL 变 ⇒ 自动失效重取。
 
 > 本地仍保留一份副本：服务端不可达时壁纸照常显示。
+
+
+## 本 fork 的改动（相对上游 573a81d）
+
+共 13 个提交。分三类：
+
+### 一、修复上游缺陷
+
+| 问题 | 根因 | 修法 |
+|---|---|---|
+| 过程步骤文字被「挖空」、滚动卡顿 | `clip-path: inset()` 用**视口坐标差值**当元素自身裁剪量，实测达 17820px | 移除内容列动态 clip-path（滚动容器已有 `overflow:auto`）|
+| 过程步骤文字不可见 | `--lg-text-primary` 硬编码，与宿主实际主题不一致，对比度仅 1.12 | 改为 `var(--dsw-alias-label-primary, 原值)` |
+| 移动端滑动「不跟手」 | 8 处 `backdrop-filter: url(#lg-...)` 是 SVG 引用滤镜，移动 GPU 逐帧重算 | `@media (max-width: 800px)` 降级为原生 `blur()` |
+| 左右背景色调分界 | 正文区有**三层**元素共用 `--dsw-alias-bg-base`，侧栏只有一层，差异被 wash 指数放大 | wash 回退固定值，可读性改由玻璃岛自身不透明度承担 |
+
+### 二、新增能力
+
+| 能力 | 说明 |
+|---|---|
+| **配置服务端持久化** | 原配置只存 `localStorage`，每个客户端各配一遍。现存 `$DSH_HOME/liquid-glass/config.json`，多端共享 |
+| **跨设备实时同步** | 每 2s 探一次 revision，变了才拉全量。设备 A 改设置，设备 B 自动跟随 |
+| **自定义壁纸同步** | 图片存服务端，按内容 sha256 命名 + `immutable` 缓存，不重复下载 |
+| **明暗按实际显示效果判断** | 自定义图原本没有 tone，永远回退宿主主题。现按「图亮度 × 不透明度 + 底层亮度 ×(1-不透明度)」实时推算 |
+
+### 三、代码结构
+
+`storage.js` 由 445 行拆为 3 个模块：
+
+```
+src/client/
+  ├── luminance.js    纯函数：亮度测量 + tone 推算（无副作用）
+  ├── storage.js      本地读写 + 服务端 config 同步
+  └── sync-queue.js   写入队列 + revision 轮询（带 stop）
+```
+
+## 与上游的关系
+
+- 已向上游提交 issue #6 与 PR #7（仅含第一个修复），**作者未处理**
+- 上游自 2026-08-15 停更，后续修复不会回流
+- 本 fork 完整包含上游全部提交（`git rev-list 573a81d --not HEAD` 为空）
 
 ## 工作原理
 
